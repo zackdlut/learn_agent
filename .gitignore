@@ -2,3 +2,4 @@
 .vscode
 .scripts/*
 .env
+*.log
