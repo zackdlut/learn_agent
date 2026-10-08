@@ -68,6 +68,17 @@ def log(message: str) -> None:
     get_logger().info("%s", message)
 
 
+def clear_log() -> None:
+    """Delete LOG_FILE so the next records start a new file."""
+    global _logger
+    if _logger is not None:
+        for handler in list(_logger.handlers):
+            handler.close()
+            _logger.removeHandler(handler)
+        _logger = None
+    log_path().unlink(missing_ok=True)
+
+
 async def alog(message: str) -> None:
     """Write one log record without blocking the event loop on the file write."""
     await asyncio.to_thread(log, message)

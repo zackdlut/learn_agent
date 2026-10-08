@@ -11,7 +11,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import Field
 
-from http_logger import make_async_client, make_sync_client
+from http_logger import clear_log, log, make_async_client, make_sync_client
 
 load_dotenv(override=True)
 
@@ -30,9 +30,6 @@ def run_bash(
     command: Annotated[str, Field(description="Shell command to execute")],
 ) -> str:
     """Execute a command in the terminal. Returns stdout and stderr, or an error string."""
-    dangerous_commands = ["rm -rf /", "reboot", "shutdown", "sudo"]
-    if any(cmd in command for cmd in dangerous_commands):
-        return "Error: This command is dangerous and not allowed."
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
         return (result.stdout + result.stderr).strip()
@@ -76,7 +73,9 @@ def run_glob(
     """List files matching a pattern. Returns matching file paths, one per line."""
     import glob as g
     try:
-        matches = sorted(match for match in g.glob(pattern) if g.path.isfile(match))
+        matches = sorted(
+            match for match in g.glob(pattern, recursive=True) if os.path.isfile(match)
+        )
         return "\n".join(matches)
     except Exception as e:
         return f"Error: {e}"
@@ -124,33 +123,72 @@ def execute_tool_call(tools_by_name, tool_call):
             tool_call_id=tool_call["id"],
         )
 
+DENY_COMMANDS = ["rm -rf /", "reboot", "shutdown", "kill -9", "chown"]
+APPROVE_COMMANDS = ["chmod", "sudo", "mv"]
+
+def check_approval(tool_call) -> bool:
+    if tool_call["name"] in ["run_bash"]:
+        log(f"Checking approval for command: {tool_call['args']['command']}")
+        if any(cmd in tool_call["args"]["command"] for cmd in APPROVE_COMMANDS):
+            return get_approval()
+    return True
+
+def get_approval() -> bool:
+    return input("Are you sure you want to proceed? (y/n): ").lower() == "y"
+
+def check_permission(tool_call) -> bool:
+    log(f"Checking permission for {tool_call['name']} with args {tool_call['args']}")
+    if tool_call["name"] in ["run_bash"]:
+        if any(cmd in tool_call["args"]["command"] for cmd in DENY_COMMANDS):
+            log(f"Denied command: {tool_call['args']['command']}")
+            return False
+    elif tool_call["name"] in ["run_read", "run_write", "run_glob", "run_delete"]:
+        if not os.access(tool_call["args"]["path"], os.R_OK | os.W_OK):
+            log(f"Permission denied for {tool_call['args']['path']}")
+            return False
+    
+    if not check_approval(tool_call):
+        log(f"Not approved  by user for {tool_call['name']} with args {tool_call['args']}")
+        return False
+    return True
+
 
 def run_turn(model, tools_by_name, history, user_input):
+    log(f"--------------run_turn start------------------")
     history.append(HumanMessage(content=user_input))
     while True:
         response = model.invoke(history)
         history.append(response)
         if not response.tool_calls:
             print(f"Assistant: {response.content}")
+            log(f"--------------run_turn end------------------")
             return
         for tool_call in response.tool_calls:
+            if not check_permission(tool_call):
+                log(f"Permission denied for {tool_call['name']} with args {tool_call['args']}")
+                history.append(ToolMessage(content=f"Permission denied for {tool_call['name']} with args {tool_call['args']}", tool_call_id=tool_call["id"]))
+                continue
             message = execute_tool_call(tools_by_name, tool_call)
             print(f"[tool] {tool_call['name']}({tool_call['args']}) -> {message.content}")
             history.append(message)
 
 
 def main():
+    clear_log()
     print("Agent Loop is starting...")
+    log("Agent Loop is starting...")
+
     tools = init_tools()
     tools_by_name = {tool.name: tool for tool in tools}
     model = init_model(tools)
     history = [SystemMessage(content=SYSTEM_PROMPT)]
     while True:
         user_input = input("You: ")
+        log(f"User: {user_input}")
         if user_input.strip().lower() in EXIT_COMMANDS:
             break
         run_turn(model, tools_by_name, history, user_input)
-
+    log("Agent Loop is exiting...")
 
 if __name__ == "__main__":
     main()
