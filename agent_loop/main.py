@@ -136,41 +136,78 @@ def check_approval(tool_call) -> bool:
 def get_approval() -> bool:
     return input("Are you sure you want to proceed? (y/n): ").lower() == "y"
 
-def check_permission(tool_call) -> bool:
+def permission_hook(tool_call) -> str | None:
     log(f"Checking permission for {tool_call['name']} with args {tool_call['args']}")
     if tool_call["name"] in ["run_bash"]:
         if any(cmd in tool_call["args"]["command"] for cmd in DENY_COMMANDS):
             log(f"Denied command: {tool_call['args']['command']}")
-            return False
+            return f"Denied command: {tool_call['args']['command']}"
     elif tool_call["name"] in ["run_read", "run_write", "run_glob", "run_delete"]:
         if not os.access(tool_call["args"]["path"], os.R_OK | os.W_OK):
             log(f"Permission denied for {tool_call['args']['path']}")
-            return False
+            return f"Permission denied for {tool_call['args']['path']}"
     
     if not check_approval(tool_call):
         log(f"Not approved  by user for {tool_call['name']} with args {tool_call['args']}")
-        return False
-    return True
+        return f"Not approved  by user for {tool_call['name']} with args {tool_call['args']}"
+    return None
 
+def context_inject_hook(user_input) -> str:
+    log(f"Injecting context into user_input: {user_input}")
+    return "you should always return response in chinese " + user_input
+
+def stop_hook(history):
+    log(f"Stopping turn: {len(history)}")
+    # summarize how many interactions have been done with LLM
+    summary = "You have had " + str(len(history)) + " interactions with the LLM."
+    print(f"Summary: {summary}")
+    return None
+
+HOOKS = {"UserPromptSubmit":[],"PreToolCall":[],"PostToolCall":[],"Stop":[]}
+def register_hook(hook_type, hook_func):
+    HOOKS[hook_type].append(hook_func)
+
+def trigger_hook(hook_type, *args, **kwargs):
+    for hook in HOOKS[hook_type]:
+        log(f"Triggering hook: {hook_type} with args {args} and kwargs {kwargs}")
+        result = hook(*args, **kwargs)
+        log(f"Hook result: {result}")
+        if result is not None:
+            return result
+    return None
 
 def run_turn(model, tools_by_name, history, user_input):
     log(f"--------------run_turn start------------------")
+    injected = trigger_hook("UserPromptSubmit", user_input)
+    if injected is not None:
+        user_input = injected
     history.append(HumanMessage(content=user_input))
+    
     while True:
         response = model.invoke(history)
         history.append(response)
         if not response.tool_calls:
             print(f"Assistant: {response.content}")
+            trigger_hook("Stop", history)
             log(f"--------------run_turn end------------------")
             return
         for tool_call in response.tool_calls:
-            if not check_permission(tool_call):
-                log(f"Permission denied for {tool_call['name']} with args {tool_call['args']}")
-                history.append(ToolMessage(content=f"Permission denied for {tool_call['name']} with args {tool_call['args']}", tool_call_id=tool_call["id"]))
+            blocked = trigger_hook("PreToolCall", tool_call)
+            if blocked:
+                log(
+                    f"PreToolCall blocked {tool_call['name']} "
+                    f"with args {tool_call['args']}: {blocked}"
+                )
+                history.append(
+                    ToolMessage(content=blocked, tool_call_id=tool_call["id"])
+                )
                 continue
             message = execute_tool_call(tools_by_name, tool_call)
             print(f"[tool] {tool_call['name']}({tool_call['args']}) -> {message.content}")
             history.append(message)
+            if not trigger_hook("PostToolCall", tool_call):
+                log(f"PostToolCall hook failed for {tool_call['name']} with args {tool_call['args']}")
+                continue
 
 
 def main():
@@ -179,6 +216,10 @@ def main():
     log("Agent Loop is starting...")
 
     tools = init_tools()
+    register_hook("PreToolCall", permission_hook)
+    register_hook("UserPromptSubmit", context_inject_hook)
+    register_hook("Stop", stop_hook)
+
     tools_by_name = {tool.name: tool for tool in tools}
     model = init_model(tools)
     history = [SystemMessage(content=SYSTEM_PROMPT)]
