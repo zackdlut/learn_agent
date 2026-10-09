@@ -3,4 +3,7 @@
 .scripts/*
 .env
 *.log
+
+# Python bytecode caches (any directory depth)
 __pycache__/
+**/__pycache__/

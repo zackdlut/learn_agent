@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 
+import glob
 import os
 import subprocess
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any, Callable
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
 from pydantic import Field
 
@@ -15,9 +21,25 @@ from http_logger import clear_log, log, make_async_client, make_sync_client
 
 load_dotenv(override=True)
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 EXIT_COMMANDS = {"exit", "quit", "bye"}
 SYSTEM_PROMPT = "You are a helpful assistant."
+BASH_TIMEOUT = 120
 
+DENY_COMMANDS = ["rm -rf /", "reboot", "shutdown", "kill -9", "chown"]
+APPROVE_COMMANDS = ["chmod", "sudo", "mv"]
+BASH_TOOL = "run_bash"
+PATH_TOOLS = {"run_read", "run_write", "run_delete"}
+
+Hook = Callable[..., Any]
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
 @tool
 def get_current_time() -> str:
@@ -31,7 +53,9 @@ def run_bash(
 ) -> str:
     """Execute a command in the terminal. Returns stdout and stderr, or an error string."""
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=BASH_TIMEOUT
+        )
         return (result.stdout + result.stderr).strip()
     except subprocess.TimeoutExpired:
         return "Error: Command timed out."
@@ -50,9 +74,7 @@ def run_read(
     """Read the content of a file. Returns the file text, truncated when limit is set."""
     with open(path, "r") as file:
         content = file.read()
-    if limit is not None:
-        return content[:limit]
-    return content
+    return content if limit is None else content[:limit]
 
 
 @tool
@@ -71,10 +93,9 @@ def run_glob(
     pattern: Annotated[str, Field(description="Glob pattern, such as *.py or agent_loop/**/*.py")],
 ) -> str:
     """List files matching a pattern. Returns matching file paths, one per line."""
-    import glob as g
     try:
         matches = sorted(
-            match for match in g.glob(pattern, recursive=True) if os.path.isfile(match)
+            match for match in glob.glob(pattern, recursive=True) if os.path.isfile(match)
         )
         return "\n".join(matches)
     except Exception as e:
@@ -93,11 +114,21 @@ def run_delete(
         return f"Error: {e}"
 
 
-def init_tools():
-    return [get_current_time, run_bash, run_read, run_write, run_glob, run_delete]
+DEFAULT_TOOLS: list[BaseTool] = [
+    get_current_time,
+    run_bash,
+    run_read,
+    run_write,
+    run_glob,
+    run_delete,
+]
 
 
-def init_model(tools):
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+def create_model(tools: list[BaseTool]):
     model = ChatOpenAI(
         model=os.getenv("OPENAI_MODEL"),
         api_key=os.getenv("OPENAI_API_KEY"),
@@ -108,128 +139,172 @@ def init_model(tools):
     return model.bind_tools(tools)
 
 
-def execute_tool_call(tools_by_name, tool_call):
-    tool = tools_by_name.get(tool_call["name"])
-    if tool is None:
-        return ToolMessage(
-            content=f"Unknown tool: {tool_call['name']}",
-            tool_call_id=tool_call["id"],
-        )
-    try:
-        return tool.invoke(tool_call)
-    except Exception as exc:
-        return ToolMessage(
-            content=f"Error: {exc}",
-            tool_call_id=tool_call["id"],
-        )
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
 
-DENY_COMMANDS = ["rm -rf /", "reboot", "shutdown", "kill -9", "chown"]
-APPROVE_COMMANDS = ["chmod", "sudo", "mv"]
+class HookBus:
+    """Named hook lists. The first handler that returns a value stops the chain."""
 
-def check_approval(tool_call) -> bool:
-    if tool_call["name"] in ["run_bash"]:
-        log(f"Checking approval for command: {tool_call['args']['command']}")
-        if any(cmd in tool_call["args"]["command"] for cmd in APPROVE_COMMANDS):
-            return get_approval()
-    return True
+    EVENTS = ("UserPromptSubmit", "PreToolCall", "PostToolCall", "Stop")
 
-def get_approval() -> bool:
-    return input("Are you sure you want to proceed? (y/n): ").lower() == "y"
+    def __init__(self):
+        self._handlers: dict[str, list[Hook]] = {event: [] for event in self.EVENTS}
 
-def permission_hook(tool_call) -> str | None:
-    log(f"Checking permission for {tool_call['name']} with args {tool_call['args']}")
-    if tool_call["name"] in ["run_bash"]:
-        if any(cmd in tool_call["args"]["command"] for cmd in DENY_COMMANDS):
-            log(f"Denied command: {tool_call['args']['command']}")
-            return f"Denied command: {tool_call['args']['command']}"
-    elif tool_call["name"] in ["run_read", "run_write", "run_glob", "run_delete"]:
-        if not os.access(tool_call["args"]["path"], os.R_OK | os.W_OK):
-            log(f"Permission denied for {tool_call['args']['path']}")
-            return f"Permission denied for {tool_call['args']['path']}"
-    
-    if not check_approval(tool_call):
-        log(f"Not approved  by user for {tool_call['name']} with args {tool_call['args']}")
-        return f"Not approved  by user for {tool_call['name']} with args {tool_call['args']}"
+    def on(self, event: str, handler: Hook) -> Hook:
+        if event not in self._handlers:
+            raise ValueError(f"Unknown hook: {event}")
+        self._handlers[event].append(handler)
+        return handler
+
+    def emit(self, event: str, *args, **kwargs):
+        for handler in self._handlers[event]:
+            log(f"Triggering hook: {event} with args {args} and kwargs {kwargs}")
+            result = handler(*args, **kwargs)
+            log(f"Hook result: {result}")
+            if result is not None:
+                return result
+        return None
+
+
+def _guard_bash(name: str, args: dict) -> str | None:
+    command = args.get("command", "")
+    if any(denied in command for denied in DENY_COMMANDS):
+        log(f"Denied command: {command}")
+        return f"Denied command: {command}"
+    if any(flagged in command for flagged in APPROVE_COMMANDS):
+        log(f"Checking approval for command: {command}")
+        if input("Are you sure you want to proceed? (y/n): ").lower() != "y":
+            reason = f"Not approved  by user for {name} with args {args}"
+            log(reason)
+            return reason
     return None
 
-def context_inject_hook(user_input) -> str:
+
+def _guard_path(path: str) -> str | None:
+    if os.access(path, os.R_OK | os.W_OK):
+        return None
+    log(f"Permission denied for {path}")
+    return f"Permission denied for {path}"
+
+
+def permission_hook(tool_call) -> str | None:
+    """Block a tool call. Return a reason string, or None to allow it."""
+    name = tool_call["name"]
+    args = tool_call["args"]
+    log(f"Checking permission for {name} with args {args}")
+
+    if name == BASH_TOOL:
+        return _guard_bash(name, args)
+    if name in PATH_TOOLS:
+        return _guard_path(args.get("path", ""))
+    return None
+
+
+def context_inject_hook(user_input: str) -> str:
     log(f"Injecting context into user_input: {user_input}")
     return "you should always return response in chinese " + user_input
 
-def stop_hook(history):
+
+def stop_hook(history) -> None:
     log(f"Stopping turn: {len(history)}")
-    # summarize how many interactions have been done with LLM
     summary = "You have had " + str(len(history)) + " interactions with the LLM."
     print(f"Summary: {summary}")
-    return None
 
-HOOKS = {"UserPromptSubmit":[],"PreToolCall":[],"PostToolCall":[],"Stop":[]}
-def register_hook(hook_type, hook_func):
-    HOOKS[hook_type].append(hook_func)
 
-def trigger_hook(hook_type, *args, **kwargs):
-    for hook in HOOKS[hook_type]:
-        log(f"Triggering hook: {hook_type} with args {args} and kwargs {kwargs}")
-        result = hook(*args, **kwargs)
-        log(f"Hook result: {result}")
-        if result is not None:
-            return result
-    return None
+DEFAULT_HOOKS: list[tuple[str, Hook]] = [
+    ("UserPromptSubmit", context_inject_hook),
+    ("PreToolCall", permission_hook),
+    ("Stop", stop_hook),
+]
 
-def run_turn(model, tools_by_name, history, user_input):
-    log(f"--------------run_turn start------------------")
-    injected = trigger_hook("UserPromptSubmit", user_input)
-    if injected is not None:
-        user_input = injected
-    history.append(HumanMessage(content=user_input))
-    
-    while True:
-        response = model.invoke(history)
-        history.append(response)
-        if not response.tool_calls:
-            print(f"Assistant: {response.content}")
-            trigger_hook("Stop", history)
-            log(f"--------------run_turn end------------------")
-            return
-        for tool_call in response.tool_calls:
-            blocked = trigger_hook("PreToolCall", tool_call)
-            if blocked:
-                log(
-                    f"PreToolCall blocked {tool_call['name']} "
-                    f"with args {tool_call['args']}: {blocked}"
-                )
-                history.append(
-                    ToolMessage(content=blocked, tool_call_id=tool_call["id"])
-                )
-                continue
-            message = execute_tool_call(tools_by_name, tool_call)
-            print(f"[tool] {tool_call['name']}({tool_call['args']}) -> {message.content}")
-            history.append(message)
-            if not trigger_hook("PostToolCall", tool_call):
-                log(f"PostToolCall hook failed for {tool_call['name']} with args {tool_call['args']}")
-                continue
 
+def create_hook_bus(hooks: list[tuple[str, Hook]]) -> HookBus:
+    bus = HookBus()
+    for event, handler in hooks:
+        bus.on(event, handler)
+    return bus
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+class Agent:
+    def __init__(
+        self,
+        tools: list[BaseTool] = DEFAULT_TOOLS,
+        hooks: list[tuple[str, Hook]] = DEFAULT_HOOKS,
+        system_prompt: str = SYSTEM_PROMPT,
+    ):
+        self.tools_by_name = {item.name: item for item in tools}
+        self.model = create_model(tools)
+        self.hooks = create_hook_bus(hooks)
+        self.history: list[BaseMessage] = [SystemMessage(content=system_prompt)]
+
+    def run(self) -> None:
+        print("Agent Loop is starting...")
+        log("Agent Loop is starting...")
+        while True:
+            user_input = input("You: ")
+            log(f"User: {user_input}")
+            if user_input.strip().lower() in EXIT_COMMANDS:
+                break
+            self.run_turn(user_input)
+        log("Agent Loop is exiting...")
+
+    def run_turn(self, user_input: str) -> None:
+        log("--------------run_turn start------------------")
+        user_input = self.hooks.emit("UserPromptSubmit", user_input) or user_input
+        self.history.append(HumanMessage(content=user_input))
+
+        while True:
+            response = self.model.invoke(self.history)
+            self.history.append(response)
+            if not response.tool_calls:
+                break
+            for tool_call in response.tool_calls:
+                self.history.append(self._handle_tool_call(tool_call))
+
+        print(f"Assistant: {response.content}")
+        self.hooks.emit("Stop", self.history)
+        log("--------------run_turn end------------------")
+
+    def _handle_tool_call(self, tool_call) -> ToolMessage:
+        blocked = self.hooks.emit("PreToolCall", tool_call)
+        if blocked:
+            log(
+                f"PreToolCall blocked {tool_call['name']} "
+                f"with args {tool_call['args']}: {blocked}"
+            )
+            return ToolMessage(content=blocked, tool_call_id=tool_call["id"])
+
+        message = self._execute_tool(tool_call)
+        print(f"[tool] {tool_call['name']}({tool_call['args']}) -> {message.content}")
+        self.hooks.emit("PostToolCall", tool_call, message)
+        return message
+
+    def _execute_tool(self, tool_call) -> ToolMessage:
+        selected = self.tools_by_name.get(tool_call["name"])
+        if selected is None:
+            content = f"Unknown tool: {tool_call['name']}"
+        else:
+            try:
+                return selected.invoke(tool_call)
+            except Exception as exc:
+                content = f"Error: {exc}"
+        return ToolMessage(content=content, tool_call_id=tool_call["id"])
+
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
 
 def main():
     clear_log()
-    print("Agent Loop is starting...")
-    log("Agent Loop is starting...")
+    agent = Agent()
+    agent.run()
 
-    tools = init_tools()
-    register_hook("PreToolCall", permission_hook)
-    register_hook("UserPromptSubmit", context_inject_hook)
-    register_hook("Stop", stop_hook)
-
-    tools_by_name = {tool.name: tool for tool in tools}
-    model = init_model(tools)
-    history = [SystemMessage(content=SYSTEM_PROMPT)]
-    while True:
-        user_input = input("You: ")
-        log(f"User: {user_input}")
-        if user_input.strip().lower() in EXIT_COMMANDS:
-            break
-        run_turn(model, tools_by_name, history, user_input)
-    log("Agent Loop is exiting...")
 
 if __name__ == "__main__":
     main()
