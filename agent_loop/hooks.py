@@ -26,12 +26,44 @@ class HookManager:
 
     def trigger(self, event: str, *args, **kwargs):
         for handler in self._handlers[event]:
-            log(f"Triggering hook: {event} with args {args} and kwargs {kwargs}")
             result = handler(*args, **kwargs)
-            log(f"Hook result: {result}")
+            _log_hook_outcome(event, handler, args, result)
             if result is not None:
                 return result
         return None
+
+
+def _log_hook_outcome(event: str, handler: Hook, args: tuple, result) -> None:
+    name = getattr(handler, "__name__", handler.__class__.__name__)
+    if event == "UserPromptSubmit" and result is not None:
+        log(f"hook {name}: user prompt augmented")
+        return
+    if event == "PreToolCall" and args:
+        tool_call = args[0]
+        label = _brief_tool_call(tool_call)
+        if result is not None:
+            log(f"hook {name}: blocked {label} — {result}")
+        return
+    if event == "Stop":
+        if args:
+            log(f"hook {name}: turn finished ({len(args[0])} messages in history)")
+        return
+    if result is not None:
+        log(f"hook {name} ({event}): {result}")
+
+
+def _brief_tool_call(tool_call) -> str:
+    name = tool_call.get("name", "?")
+    args = tool_call.get("args") or {}
+    if not args:
+        return name
+    parts = []
+    for key, value in args.items():
+        text = repr(value)
+        if len(text) > 60:
+            text = f"{text[:57]}…"
+        parts.append(f"{key}={text}")
+    return f"{name}({', '.join(parts)})"
 
 
 def _guard_bash(name: str, args: dict) -> str | None:
@@ -59,8 +91,6 @@ def permission_hook(tool_call) -> str | None:
     """Block a tool call. Return a reason string, or None to allow it."""
     name = tool_call["name"]
     args = tool_call["args"]
-    log(f"Checking permission for {name} with args {args}")
-
     if name == BASH_TOOL:
         return _guard_bash(name, args)
     if name in PATH_TOOLS:
@@ -69,12 +99,10 @@ def permission_hook(tool_call) -> str | None:
 
 
 def context_inject_hook(user_input: str) -> str:
-    log(f"Injecting context into user_input: {user_input}")
     return "you should always return response in chinese " + user_input
 
 
 def stop_hook(history) -> None:
-    log(f"Stopping turn: {len(history)}")
     summary = "You have had " + str(len(history)) + " interactions with the LLM."
     print(f"Summary: {summary}")
 

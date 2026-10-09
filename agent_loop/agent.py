@@ -12,7 +12,7 @@ from .config import (
 )
 from .env import ensure_env_loaded
 from .hooks import DEFAULT_HOOKS, create_hooks
-from .http_logger import log
+from .http_logger import log, log_section
 from .model import create_model
 from .skills import build_system_prompt
 from .tools import DEFAULT_TOOLS
@@ -46,7 +46,7 @@ class Agent:
         log("Agent Loop is exiting...")
 
     def run_turn(self, user_input: str) -> None:
-        log("--------------run_turn start------------------")
+        log_section("Turn start")
         user_input = self.hooks.trigger("UserPromptSubmit", user_input) or user_input
         self.history.append(HumanMessage(content=user_input))
         self._tool_rounds_without_todo_write = 0
@@ -64,8 +64,13 @@ class Agent:
             self._after_tool_round(response.tool_calls, round_messages)
 
         print(f"Assistant: {response.content}")
+        if response.content:
+            preview = response.content if len(response.content) <= 800 else (
+                f"{response.content[:800]}… ({len(response.content)} chars)"
+            )
+            log(f"Assistant: {preview}")
         self.hooks.trigger("Stop", self.history)
-        log("--------------run_turn end------------------")
+        log_section("Turn end")
 
     def _after_tool_round(self, tool_calls, round_messages: list[ToolMessage]) -> None:
         used_todo_write = any(call["name"] == TODO_WRITE_TOOL for call in tool_calls)
@@ -97,9 +102,12 @@ class Agent:
             return ToolMessage(content=blocked, tool_call_id=tool_call["id"])
 
         message = self._execute_tool(tool_call)
-        print(
-            f"[tool] {tool_call['name']}({tool_call['args']}) -> "
-            f"{self._tool_content_for_terminal(tool_call['name'], message.content)}"
+        terminal_body = self._tool_content_for_terminal(
+            tool_call["name"], message.content
+        )
+        print(f"[tool] {tool_call['name']}({tool_call['args']}) -> {terminal_body}")
+        log(
+            f"tool {tool_call['name']}({tool_call['args']}) -> {terminal_body}"
         )
         self.hooks.trigger("PostToolCall", tool_call, message)
         return message

@@ -3,6 +3,10 @@
 LOG_FILE comes from the environment (this repo's .env). A relative path is
 resolved from the directory that contains .env.
 
+JSON bodies are parsed and re-serialized with indentation and ensure_ascii=False.
+Nested JSON strings (e.g. tool call ``arguments``) are expanded so the log stays
+readable without escaped inner JSON.
+
 Sync hooks go on httpx.Client. Async hooks go on httpx.AsyncClient.
 ChatOpenAI accepts both via http_client and http_async_client.
 """
@@ -57,6 +61,12 @@ def get_logger() -> logging.Logger:
 def log(message: str) -> None:
     """Write one log record from synchronous code."""
     get_logger().info("%s", message)
+
+
+def log_section(title: str) -> None:
+    """Write a visible section header."""
+    bar = "─" * 56
+    log(f"\n{bar}\n  {title}\n{bar}")
 
 
 def clear_log() -> None:
@@ -197,7 +207,25 @@ def _pretty_body(body: str, content_type: str) -> str:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         return body
-    return json.dumps(parsed, indent=2, ensure_ascii=False)
+    expanded = _expand_embedded_json_strings(parsed)
+    return json.dumps(expanded, indent=2, ensure_ascii=False)
+
+
+def _expand_embedded_json_strings(value: Any) -> Any:
+    """Turn JSON-encoded strings (e.g. tool arguments) into nested objects."""
+    if isinstance(value, dict):
+        return {key: _expand_embedded_json_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_embedded_json_strings(item) for item in value]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped and stripped[0] in "{[":
+            try:
+                inner = json.loads(stripped)
+            except json.JSONDecodeError:
+                return value
+            return _expand_embedded_json_strings(inner)
+    return value
 
 
 def _is_json_content(content_type: str) -> bool:
