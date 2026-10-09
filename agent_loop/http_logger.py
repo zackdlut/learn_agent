@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from dotenv import load_dotenv
+
+from .env import env_file, ensure_env_loaded
 
 _LOGGER_NAME = "agent_loop.http"
 _logger: logging.Logger | None = None
@@ -25,27 +26,17 @@ _logger: logging.Logger | None = None
 
 def log_path() -> Path:
     """Return the log file path from LOG_FILE."""
-    env_file = _find_env_file()
-    if env_file is not None:
-        load_dotenv(env_file, override=False)
+    ensure_env_loaded()
+    dotenv = env_file()
     raw = os.getenv("LOG_FILE")
     if not raw:
         raise RuntimeError("LOG_FILE is not set. Add it to .env.")
     path = Path(raw).expanduser()
     if not path.is_absolute():
-        base = env_file.parent if env_file is not None else Path.cwd()
+        base = dotenv.parent if dotenv is not None else Path.cwd()
         path = base / path
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def _find_env_file() -> Path | None:
-    start = Path(__file__).resolve().parent
-    for directory in (start, *start.parents):
-        candidate = directory / ".env"
-        if candidate.is_file():
-            return candidate
-    return None
 
 
 def get_logger() -> logging.Logger:
