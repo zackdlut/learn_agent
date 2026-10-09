@@ -9,6 +9,7 @@ from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 
 from .config import BASH_TIMEOUT
+from .skills import get_skill_loader
 
 
 @tool
@@ -154,6 +155,18 @@ def run_todo_write(
     payload = [task.model_dump() for task in all_tasks]
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
+
+@tool
+def load_skills(
+    names: Annotated[
+        list[str],
+        Field(description="Skill names from the system prompt catalog"),
+    ],
+) -> str:
+    """Load full skill instructions by name. Use when a task matches a listed skill."""
+    return get_skill_loader().load(names)
+
+
 DEFAULT_TOOLS: list[BaseTool] = [
     get_current_time,
     run_bash,
@@ -162,4 +175,5 @@ DEFAULT_TOOLS: list[BaseTool] = [
     run_glob,
     run_delete,
     run_todo_write,
+    load_skills,
 ]

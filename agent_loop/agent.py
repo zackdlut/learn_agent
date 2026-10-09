@@ -7,12 +7,14 @@ from .config import (
     SYSTEM_PROMPT,
     TODO_WRITE_REMINDER,
     TODO_WRITE_REMINDER_ROUNDS,
+    LOAD_SKILLS_TOOL,
     TODO_WRITE_TOOL,
 )
 from .env import ensure_env_loaded
 from .hooks import DEFAULT_HOOKS, create_hooks
 from .http_logger import log
 from .model import create_model
+from .skills import build_system_prompt
 from .tools import DEFAULT_TOOLS
 
 
@@ -21,9 +23,11 @@ class Agent:
         self,
         tools: list[BaseTool] = DEFAULT_TOOLS,
         hooks: list[tuple[str, Hook]] = DEFAULT_HOOKS,
-        system_prompt: str = SYSTEM_PROMPT,
+        system_prompt: str | None = None,
     ):
         ensure_env_loaded()
+        if system_prompt is None:
+            system_prompt = build_system_prompt(SYSTEM_PROMPT)
         self.tools_by_name = {item.name: item for item in tools}
         self.model = create_model(tools)
         self.hooks = create_hooks(hooks)
@@ -93,9 +97,22 @@ class Agent:
             return ToolMessage(content=blocked, tool_call_id=tool_call["id"])
 
         message = self._execute_tool(tool_call)
-        print(f"[tool] {tool_call['name']}({tool_call['args']}) -> {message.content}")
+        print(
+            f"[tool] {tool_call['name']}({tool_call['args']}) -> "
+            f"{self._tool_content_for_terminal(tool_call['name'], message.content)}"
+        )
         self.hooks.trigger("PostToolCall", tool_call, message)
         return message
+
+    @staticmethod
+    def _tool_content_for_terminal(tool_name: str, content: str) -> str:
+        """Full tool output still goes to the model; terminal log stays readable."""
+        if tool_name == LOAD_SKILLS_TOOL:
+            n = len(content)
+            return f"<skill body loaded, {n} chars — not shown in terminal>"
+        if len(content) > 400:
+            return f"{content[:400]}… ({len(content)} chars total)"
+        return content
 
     def _execute_tool(self, tool_call) -> ToolMessage:
         selected = self.tools_by_name.get(tool_call["name"])
