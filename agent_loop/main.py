@@ -143,7 +143,9 @@ def create_model(tools: list[BaseTool]):
 # Hooks
 # ---------------------------------------------------------------------------
 
-class HookBus:
+
+
+class HookManager:
     """Named hook lists. The first handler that returns a value stops the chain."""
 
     EVENTS = ("UserPromptSubmit", "PreToolCall", "PostToolCall", "Stop")
@@ -151,13 +153,13 @@ class HookBus:
     def __init__(self):
         self._handlers: dict[str, list[Hook]] = {event: [] for event in self.EVENTS}
 
-    def on(self, event: str, handler: Hook) -> Hook:
+    def register(self, event: str, handler: Hook) -> Hook:
         if event not in self._handlers:
             raise ValueError(f"Unknown hook: {event}")
         self._handlers[event].append(handler)
         return handler
 
-    def emit(self, event: str, *args, **kwargs):
+    def trigger(self, event: str, *args, **kwargs):
         for handler in self._handlers[event]:
             log(f"Triggering hook: {event} with args {args} and kwargs {kwargs}")
             result = handler(*args, **kwargs)
@@ -219,11 +221,11 @@ DEFAULT_HOOKS: list[tuple[str, Hook]] = [
 ]
 
 
-def create_hook_bus(hooks: list[tuple[str, Hook]]) -> HookBus:
-    bus = HookBus()
+def create_hooks(hooks: list[tuple[str, Hook]]) -> HookManager:
+    manager = HookManager()
     for event, handler in hooks:
-        bus.on(event, handler)
-    return bus
+        manager.register(event, handler)
+    return manager
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +241,7 @@ class Agent:
     ):
         self.tools_by_name = {item.name: item for item in tools}
         self.model = create_model(tools)
-        self.hooks = create_hook_bus(hooks)
+        self.hooks = create_hooks(hooks)
         self.history: list[BaseMessage] = [SystemMessage(content=system_prompt)]
 
     def run(self) -> None:
@@ -255,7 +257,7 @@ class Agent:
 
     def run_turn(self, user_input: str) -> None:
         log("--------------run_turn start------------------")
-        user_input = self.hooks.emit("UserPromptSubmit", user_input) or user_input
+        user_input = self.hooks.trigger("UserPromptSubmit", user_input) or user_input
         self.history.append(HumanMessage(content=user_input))
 
         while True:
@@ -267,11 +269,11 @@ class Agent:
                 self.history.append(self._handle_tool_call(tool_call))
 
         print(f"Assistant: {response.content}")
-        self.hooks.emit("Stop", self.history)
+        self.hooks.trigger("Stop", self.history)
         log("--------------run_turn end------------------")
 
     def _handle_tool_call(self, tool_call) -> ToolMessage:
-        blocked = self.hooks.emit("PreToolCall", tool_call)
+        blocked = self.hooks.trigger("PreToolCall", tool_call)
         if blocked:
             log(
                 f"PreToolCall blocked {tool_call['name']} "
@@ -281,7 +283,7 @@ class Agent:
 
         message = self._execute_tool(tool_call)
         print(f"[tool] {tool_call['name']}({tool_call['args']}) -> {message.content}")
-        self.hooks.emit("PostToolCall", tool_call, message)
+        self.hooks.trigger("PostToolCall", tool_call, message)
         return message
 
     def _execute_tool(self, tool_call) -> ToolMessage:
