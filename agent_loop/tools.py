@@ -1,11 +1,12 @@
 import glob
 import os
+import json
 import subprocess
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langchain_core.tools import BaseTool, tool
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from .config import BASH_TIMEOUT
 
@@ -81,7 +82,77 @@ def run_delete(
         return "File deleted successfully."
     except Exception as e:
         return f"Error: {e}"
+TodoStatus = Literal["pending", "in_progress", "completed"]
 
+
+class TodoTask(BaseModel):
+    id: str = Field(description="Unique task identifier")
+    content: str = Field(description="Task description")
+    status: TodoStatus = Field(
+        description="Task state: pending, in_progress, or completed"
+    )
+
+
+class TodoStore:
+    """Session-scoped task list (one store per process)."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, TodoTask] = {}
+
+    def upsert_many(self, tasks: list[TodoTask]) -> list[TodoTask]:
+        for task in tasks:
+            self._items[task.id] = task
+        return self.list_tasks()
+
+    def list_tasks(self) -> list[TodoTask]:
+        return sorted(self._items.values(), key=lambda t: t.id)
+
+
+_todo_store = TodoStore()
+
+
+def _parse_todo_payload(
+    todos: list[TodoTask] | list[dict] | str,
+) -> tuple[list[TodoTask] | None, str | None]:
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except json.JSONDecodeError as exc:
+            return None, f"Invalid JSON: {exc}"
+    if not isinstance(todos, list):
+        return None, "todos must be a list of tasks"
+
+    parsed: list[TodoTask] = []
+    for index, item in enumerate(todos):
+        try:
+            if isinstance(item, TodoTask):
+                parsed.append(item)
+            else:
+                parsed.append(TodoTask.model_validate(item))
+        except Exception as exc:
+            return None, f"todo[{index}]: {exc}"
+    return parsed, None
+
+
+@tool
+def run_todo_write(
+    todos: Annotated[
+        list[TodoTask] | str,
+        Field(
+            description=(
+                "Tasks to create or update. Each task has id, content, and status "
+                "(pending | in_progress | completed). Same id updates the existing task."
+            ),
+        ),
+    ],
+) -> str:
+    """Record or update the task breakdown for the current session. Returns the full task list."""
+    tasks, error = _parse_todo_payload(todos)
+    if error:
+        return error
+    all_tasks = _todo_store.upsert_many(tasks)
+    payload = [task.model_dump() for task in all_tasks]
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 DEFAULT_TOOLS: list[BaseTool] = [
     get_current_time,
@@ -90,4 +161,5 @@ DEFAULT_TOOLS: list[BaseTool] = [
     run_write,
     run_glob,
     run_delete,
+    run_todo_write,
 ]
